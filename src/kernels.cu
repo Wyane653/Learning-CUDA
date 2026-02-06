@@ -1,7 +1,16 @@
 #include <vector>
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+
 #include "../tester/utils.h"
+
+// 添加错误检查宏（放在文件顶部，include之后）
+#define CHECK_CUDA_ERROR(call) {\
+    cudaError_t err = (call);\
+    if (err != cudaSuccess) {\
+        fprintf(stderr, "[CUDA Error] %s:%d | %s -> %s\n", __FILE__, __LINE__, #call, cudaGetErrorString(err));\
+        exit(EXIT_FAILURE);\
+    }\
+}
 
 
 /**
@@ -18,75 +27,49 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+
 template <typename T>
-__global__ void trace_kernel(const T* matrix, T* result, int rows, int cols) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int n_diag = (rows < cols) ? rows : cols;
-    
-    if (idx < n_diag) {
-        // 计算对角线元素在行优先存储中的索引
-        T diag_value = matrix[idx * cols + idx];
-        
-        // 使用原子操作累加结果
-        atomicAdd(result, diag_value);
+__global__ void trace_kernel(const T* input, T* result, int min_dim, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < min_dim) {
+        // 行优先存储中，对角线元素的索引为 i * cols + i
+        atomicAdd(result, input[idx * cols + idx]);
     }
 }
 
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-    // 检查输入有效性
-    if (rows == 0 || cols == 0 || h_input.size() != rows * cols) {
-        return T(0);
-    }
+    fprintf(stderr, "[DEBUG] My NEW trace function is called! rows=%zu, cols=%zu\n", rows, cols);
+    // 0. 计算基本参数
+    size_t num_elements = h_input.size();
+    int min_dim = static_cast<int>((rows < cols) ? rows : cols); // 强制转换为int，匹配内核参数
+    T h_result = T(0);
+
+    // 1. 分配设备内存
+    T *d_input = nullptr, *d_result = nullptr;
+    CHECK_CUDA_ERROR(cudaMalloc(&d_input, num_elements * sizeof(T)));
+    CHECK_CUDA_ERROR(cudaMalloc(&d_result, sizeof(T)));
+
+    // 2. 初始化设备结果内存为0，并拷贝输入数据
+    CHECK_CUDA_ERROR(cudaMemset(d_result, 0, sizeof(T)));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_input, h_input.data(), num_elements * sizeof(T), cudaMemcpyHostToDevice));
+
+    // 3. 启动内核
+    int block_size = 256;
+    int grid_size = (min_dim + block_size - 1) / block_size;
+    trace_kernel<T><<<grid_size, block_size>>>(d_input, d_result, min_dim, static_cast<int>(cols));
     
-    // 计算对角线元素个数
-    size_t n_diag = (rows < cols) ? rows : cols;
-    
-    // 分配设备内存
-    T* d_input = nullptr;
-    T* d_result = nullptr;
-    
-    // 为矩阵数据分配设备内存
-    cudaMalloc(&d_input, h_input.size() * sizeof(T));
-    // 为结果分配设备内存
-    cudaMalloc(&d_result, sizeof(T));
-    
-    // 将数据从主机复制到设备
-    cudaMemcpy(d_input, h_input.data(), 
-               h_input.size() * sizeof(T), 
-               cudaMemcpyHostToDevice);
-    
-    // 初始化结果为0
-    T zero = T(0);
-    cudaMemcpy(d_result, &zero, sizeof(T), cudaMemcpyHostToDevice);
-    
-    // 配置核函数参数
-    const int blockSize = 256;
-    int gridSize = (n_diag + blockSize - 1) / blockSize;
-    
-    // 调用核函数
-    trace_kernel<T><<<gridSize, blockSize>>>(d_input, d_result, 
-                                             static_cast<int>(rows), 
-                                             static_cast<int>(cols));
-    
-    // 检查是否有CUDA错误
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in trace kernel: %s\n", 
-                cudaGetErrorString(err));
-    }
-    
-    // 同步设备，确保核函数执行完成
-    cudaDeviceSynchronize();
-    
-    // 将结果从设备复制回主机
-    T h_result;
-    cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
-    
-    // 释放设备内存
-    cudaFree(d_input);
-    cudaFree(d_result);
-    
+    // 4. 检查内核启动和运行是否有错误
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize()); // 关键：等待内核完成
+
+    // 5. 拷贝结果回主机
+    CHECK_CUDA_ERROR(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
+
+    // 6. 释放设备内存
+    CHECK_CUDA_ERROR(cudaFree(d_input));
+    CHECK_CUDA_ERROR(cudaFree(d_result));
+
     return h_result;
 }
 
@@ -108,84 +91,78 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  */
 
 template <typename T>
-__global__ void simple_attention_kernel(
+__global__ void flash_attention_kernel(
     const T* Q, const T* K, const T* V, T* O,
     int batch_size, int tgt_len, int src_len,
-    int query_heads, int kv_heads, int head_dim,
-    T scale, bool is_causal) {
-    
-    // 简单实现：只处理第一个batch、第一个head、第一个位置
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        int idx = 0;
-        // 初始化输出为0
-        for (int d = 0; d < head_dim; d++) {
-            O[idx * head_dim + d] = T(0);
+    int query_heads, int kv_heads, int head_dim, bool is_causal,
+    int BLOCK_M, int BLOCK_N) { // 分块大小参数
+
+    // 为当前block分配共享内存，用于存储Q、K、V的块
+    extern __shared__ __align__(sizeof(T)) unsigned char shared_mem[];
+    T* q_tile = reinterpret_cast<T*>(shared_mem);
+    T* k_tile = reinterpret_cast<T*>(&q_tile[BLOCK_M * head_dim]);
+    T* v_tile = reinterpret_cast<T*>(&k_tile[BLOCK_N * head_dim]);
+
+    int batch = blockIdx.z;
+    int query_head = blockIdx.y;
+    int kv_head = query_head * kv_heads / query_heads; // GQA: 映射query head到对应的kv head组
+
+    // 1. 初始化当前block负责的输出块O_tile和用于在线softmax的统计量(l_i, m_i)
+    T* o_tile = ...; // 在寄存器或共享内存中
+    T l_i = 0.0;
+    T m_i = -INFINITY;
+
+    // 2. 外层循环: 遍历目标序列的块 (每个block处理一个Q块)
+    for (int m_start = 0; m_start < tgt_len; m_start += BLOCK_M) {
+        // 3. 从全局内存加载当前Q块到共享内存q_tile
+        // 4. 内层循环: 遍历源序列的块 (K, V)
+        for (int n_start = 0; n_start < src_len; n_start += BLOCK_N) {
+            // 4.1 从全局内存加载当前K块和V块到共享内存k_tile, v_tile
+            __syncthreads();
+
+            // 4.2 计算当前块的注意力分数: S_tile = q_tile @ k_tile^T
+            // 4.3 如果 is_causal，应用因果掩码 (对于 n_start + j > m_start + i 的位置，S_tile = -inf)
+            // 4.4 **在线Softmax更新**:
+            //     m_ij = max(row_max_of_S_tile, m_i_old)
+            //     P_tile = exp(S_tile - m_ij) （数值稳定的safe softmax[citation:2]）
+            //     l_ij = exp(m_i_old - m_ij) * l_i_old + row_sum_of_P_tile
+            //     更新输出块: o_tile = diag(exp(m_i_old - m_ij)) * o_tile_old + P_tile @ v_tile
+            //     更新统计量: m_i = m_ij, l_i = l_ij
+            __syncthreads();
         }
+        // 5. 将最终计算好的输出块o_tile写回全局内存O
     }
 }
 
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int batch_size, int tgt_len, int src_len,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
-    
-    // 计算各张量的总元素数
-    size_t q_size = batch_size * target_seq_len * query_heads * head_dim;
-    size_t k_size = batch_size * src_seq_len * kv_heads * head_dim;
-    size_t v_size = batch_size * src_seq_len * kv_heads * head_dim;
-    size_t o_size = batch_size * target_seq_len * query_heads * head_dim;
-    
-    // 检查输入输出大小是否匹配
-    if (h_q.size() != q_size || h_k.size() != k_size || 
-        h_v.size() != v_size || h_o.size() != o_size) {
-        return;
-    }
-    
-    // 分配设备内存
-    T *d_q, *d_k, *d_v, *d_o;
-    cudaMalloc(&d_q, q_size * sizeof(T));
-    cudaMalloc(&d_k, k_size * sizeof(T));
-    cudaMalloc(&d_v, v_size * sizeof(T));
-    cudaMalloc(&d_o, o_size * sizeof(T));
-    
-    // 拷贝数据到设备
-    cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), k_size * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), v_size * sizeof(T), cudaMemcpyHostToDevice);
-    
-    // 计算缩放因子
-    T scale = T(1.0 / sqrtf(static_cast<float>(head_dim)));
-    
-    // 简单的核函数配置 - 只用一个线程块
-    dim3 blockDim(1, 1, 1);
-    dim3 gridDim(1, 1, 1);
-    
-    // 调用简化的核函数
-    simple_attention_kernel<<<gridDim, blockDim>>>(
+
+    // 参数校验，分配设备内存，数据拷贝...
+    size_t q_size = batch_size * tgt_len * query_heads * head_dim;
+    // ... (分配 d_q, d_k, d_v, d_o)
+
+    // 设置分块大小 (需要根据共享内存大小和head_dim调整)
+    const int BLOCK_M = 64; // Q块大小
+    const int BLOCK_N = 64; // K,V块大小
+
+    // 计算动态共享内存大小
+    size_t shared_mem_size = (BLOCK_M * head_dim + 2 * BLOCK_N * head_dim) * sizeof(T);
+
+    // 设置内核执行维度
+    dim3 grid(batch_size, query_heads); // 一个block处理一个batch的一个query head
+    // 注意：实际需要更精细的网格划分来处理序列长度分块，此处为简化表示
+
+    // 启动内核
+    flash_attention_kernel<T><<<grid, num_threads, shared_mem_size>>>(
         d_q, d_k, d_v, d_o,
-        batch_size, target_seq_len, src_seq_len,
-        query_heads, kv_heads, head_dim,
-        scale, is_causal
-    );
-    
-    // 检查错误
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in flashAttention kernel: %s\n", 
-                cudaGetErrorString(err));
-    }
-    
-    cudaDeviceSynchronize();
-    
-    // 将结果拷贝回主机
-    cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost);
-    
-    // 释放设备内存
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
+        batch_size, tgt_len, src_len,
+        query_heads, kv_heads, head_dim, is_causal,
+        BLOCK_M, BLOCK_N);
+
+    // 设备同步，拷贝结果回主机，释放内存...
 }
 
 // *********************************************************************
